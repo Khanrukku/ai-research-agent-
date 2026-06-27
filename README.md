@@ -1,3 +1,9 @@
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230435" src="https://github.com/user-attachments/assets/b58c9a7c-ae94-4562-83bf-796f44150972" />
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230425" src="https://github.com/user-attachments/assets/d116ac2e-0d57-4736-88b3-3beda812ea77" />
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230417" src="https://github.com/user-attachments/assets/08c876c4-8b22-4f27-ac7d-34865d77401e" />
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230435" src="https://github.com/user-attachments/assets/c848ed29-710e-4890-b818-9e9b04953a0e" />
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230425" src="https://github.com/user-attachments/assets/588aa476-b514-41ac-bab0-abb3e9b53eab" />
+<img width="1920" height="1080" alt="Screenshot 2026-06-27 230417" src="https://github.com/user-attachments/assets/670c2240-6153-49c1-8fbb-a6bfa400feef" />
 # 🔬 AI Research Agent
 
 > **Multi-step agentic RAG system** combining vector search, knowledge graphs, and LLM orchestration — built for the Google SWE Internship portfolio.
