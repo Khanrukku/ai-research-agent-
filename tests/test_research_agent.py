@@ -1,7 +1,7 @@
 import pytest
 
 from research_agent import ResearchAgent, ResearchResult
-
+ 
 
 def test_empty_query_is_rejected():
     agent = ResearchAgent()
