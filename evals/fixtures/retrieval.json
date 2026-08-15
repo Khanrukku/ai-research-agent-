@@ -1,0 +1,6 @@
+[
+  {"id":"rag","text":"Retrieval augmented generation combines a generator with an external retrieval system so responses can use non-parametric evidence.","title":"Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks","relevant":["rag"]},
+  {"id":"transformer","text":"The Transformer architecture relies on self-attention and feed-forward layers and removes recurrence from sequence transduction.","title":"Attention Is All You Need","relevant":["transformer"]},
+  {"id":"finetune","text":"Fine-tuning adapts pretrained model parameters to a downstream task using task-specific training data.","title":"Parameter-Efficient Transfer Learning","relevant":["finetune"]},
+  {"id":"graph","text":"Knowledge graphs represent entities and relationships as nodes and edges and support graph traversal for relationship expansion.","title":"Knowledge Graphs and Their Applications","relevant":["graph"]}
+]
