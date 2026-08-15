@@ -9,9 +9,6 @@ A lightweight research agent that:
 4. Builds a retrieval-augmented context.
 5. Uses an LLM to synthesize a cited report.
 6. Maintains lightweight session memory.
-
-The implementation intentionally keeps external dependencies small
-and only claims functionality that is actually implemented.
 """
 
 from __future__ import annotations
@@ -20,7 +17,7 @@ import json
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,7 +27,6 @@ from openai import OpenAI
 
 
 load_dotenv()
-
 
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
@@ -64,23 +60,7 @@ class ResearchResult:
 
 
 class ResearchAgent:
-    """
-    Research agent implementing:
-
-    Query
-      ↓
-    Planning
-      ↓
-    Retrieval
-      ↓
-    Relevance ranking
-      ↓
-    RAG context construction
-      ↓
-    LLM synthesis
-      ↓
-    Cited report
-    """
+    """Research agent for retrieval and evidence-grounded synthesis."""
 
     def __init__(
         self,
@@ -105,27 +85,13 @@ class ResearchAgent:
             else None
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def research(
         self,
         query: str,
         output_format: str = "markdown",
         depth: str = "standard",
     ) -> str:
-        """
-        Execute the complete research workflow.
-
-        Args:
-            query: Research question.
-            output_format: markdown or json.
-            depth: quick, standard, or comprehensive.
-
-        Returns:
-            Generated research report.
-        """
+        """Execute the complete research workflow."""
 
         query = query.strip()
 
@@ -168,10 +134,6 @@ class ResearchAgent:
             output_format=output_format,
         )
 
-    # ------------------------------------------------------------------
-    # Planning
-    # ------------------------------------------------------------------
-
     def _create_research_plan(
         self,
         query: str,
@@ -211,10 +173,6 @@ class ResearchAgent:
             "max_sources": self.max_sources,
             "timestamp": self._timestamp(),
         }
-
-    # ------------------------------------------------------------------
-    # Retrieval
-    # ------------------------------------------------------------------
 
     def _gather_information(
         self,
@@ -315,10 +273,6 @@ class ResearchAgent:
 
         return results[: self.max_sources]
 
-    # ------------------------------------------------------------------
-    # Relevance ranking
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _relevance_score(
         query_terms: set[str],
@@ -326,11 +280,11 @@ class ResearchAgent:
         content: str,
     ) -> float:
 
-        title_terms = ResearchAgent._tokenize(title)
-        content_terms = ResearchAgent._tokenize(content)
-
         if not query_terms:
             return 0.0
+
+        title_terms = ResearchAgent._tokenize(title)
+        content_terms = ResearchAgent._tokenize(content)
 
         title_overlap = len(
             query_terms.intersection(title_terms)
@@ -352,7 +306,6 @@ class ResearchAgent:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Convert text into normalized keyword tokens."""
 
         stop_words = {
             "the",
@@ -386,10 +339,6 @@ class ResearchAgent:
             and token not in stop_words
         }
 
-    # ------------------------------------------------------------------
-    # RAG
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _build_rag_context(
         sources: list[ResearchResult],
@@ -397,8 +346,10 @@ class ResearchAgent:
 
         context_parts = []
 
-        for index, source in enumerate(sources, start=1):
-
+        for index, source in enumerate(
+            sources,
+            start=1,
+        ):
             context_parts.append(
                 f"""
 SOURCE {index}
@@ -413,10 +364,6 @@ Abstract:
 
         return "\n\n".join(context_parts)
 
-    # ------------------------------------------------------------------
-    # LLM synthesis
-    # ------------------------------------------------------------------
-
     def _synthesize_report(
         self,
         query: str,
@@ -424,9 +371,7 @@ Abstract:
         plan: dict[str, Any],
     ) -> str:
 
-        context = self._build_rag_context(
-            sources
-        )
+        context = self._build_rag_context(sources)
 
         if self.client is None:
             return self._fallback_report(
@@ -453,10 +398,10 @@ Requirements:
 3. Distinguish evidence from interpretation.
 4. Do not invent facts that are not supported by the sources.
 5. Include inline citations using [Source 1], [Source 2], etc.
-6. Include a Sources section containing the source title and URL.
+6. Include a Sources section containing source titles and URLs.
 7. If the sources are insufficient to answer a claim, explicitly say so.
 8. Do not fabricate performance metrics.
-9. Do not claim that the retrieved papers prove causation unless they do.
+9. Do not claim causation unless supported by the sources.
 
 Return Markdown.
 """.strip()
@@ -475,10 +420,6 @@ Return Markdown.
 
         return report
 
-    # ------------------------------------------------------------------
-    # Fallback report
-    # ------------------------------------------------------------------
-
     def _fallback_report(
         self,
         query: str,
@@ -493,7 +434,7 @@ Return Markdown.
             "",
             (
                 "No OPENAI_API_KEY was configured, so the agent "
-                "returned the retrieved evidence without LLM synthesis."
+                "returned retrieved evidence without LLM synthesis."
             ),
             "",
         ]
@@ -520,10 +461,6 @@ Return Markdown.
 
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _format_output(
         report: str,
@@ -549,10 +486,6 @@ Return Markdown.
             "Unsupported output format."
         )
 
-    # ------------------------------------------------------------------
-    # Memory
-    # ------------------------------------------------------------------
-
     def _update_context_memory(
         self,
         query: str,
@@ -570,9 +503,10 @@ Return Markdown.
 
         self.context_memory = self.context_memory[-10:]
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+    def get_context_memory(self) -> list[dict[str, Any]]:
+        """Return recent research session memory."""
+
+        return list(self.context_memory)
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -583,15 +517,6 @@ Return Markdown.
         return datetime.now(
             timezone.utc
         ).isoformat()
-
-    # ------------------------------------------------------------------
-    # Public serialization helper
-    # ------------------------------------------------------------------
-
-    def get_context_memory(self) -> list[dict[str, Any]]:
-        """Return recent research session memory."""
-
-        return list(self.context_memory)
 
 
 def main() -> None:
