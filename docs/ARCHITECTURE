@@ -1,0 +1,39 @@
+# Architecture
+
+```text
+                    ┌──────────────────────┐
+                    │ FastAPI / MCP Client │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │ Stateless Orchestrator│
+                    └──────────┬───────────┘
+                               │ asyncio.gather
+             ┌─────────────────┼──────────────────┐
+             ▼                 ▼                  ▼
+      Academic Agent     Semantic RAG Agent   Graph Agent
+          arXiv             ChromaDB            Neo4j
+             └─────────────────┼──────────────────┘
+                               ▼
+                     Evidence Ranker/Verifier
+                               ▼
+                       Gemini Synthesis
+                               ▼
+                    Cited Research Report
+```
+
+## Scalability
+
+Workers contain no user/session state. Persistent state is externalized to ChromaDB and Neo4j. The AWS ECS task definition uses multiple Fargate replicas (`desired_count`) so identical workers can be scaled horizontally.
+
+## Retrieval
+
+ChromaDB is configured with cosine distance and HNSW indexing. Retrieval scores are normalized from Chroma distance to a cosine-similarity-style relevance score. The evaluation harness reports Precision@K, Recall@K, and MRR.
+
+## Graph reasoning
+
+Neo4j stores entities and relationships. `bfs_entity_neighborhood` expands the relationship frontier by shortest traversal depth, making the BFS behavior explicit and testable.
+
+## MCP
+
+`app/mcp/server.py` exposes research, semantic retrieval, entity lookup, and graph-BFS tools through the Model Context Protocol.
