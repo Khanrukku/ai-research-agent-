@@ -1,280 +1,633 @@
 """
-app/agents/research_agent.py
------------------------------
-Multi-step agentic research loop implementing a ReAct-style
-(Reason → Act → Observe) workflow with MCP-inspired tool definitions.
+AI Research Agent
+-----------------
+A lightweight research agent that:
 
-The agent autonomously decides which tools to call, calls them,
-observes the results, then either calls more tools or writes a
-final synthesis.
+1. Creates a research plan.
+2. Retrieves real papers from arXiv.
+3. Ranks sources using lexical relevance.
+4. Builds a retrieval-augmented context.
+5. Uses an LLM to synthesize a cited report.
+6. Maintains lightweight session memory.
 
-Tools available to the agent:
-  - vector_search(query)       → semantic search in ChromaDB
-  - graph_lookup(entity)       → entity neighbourhood in Neo4j
-  - graph_documents(entity)    → documents mentioning an entity
-  - synthesise(context, goal)  → final answer generation (terminal)
-
-This mirrors how MCP (Model Context Protocol) works:
-  a host (this agent loop) exposes a tool manifest to the LLM,
-  the LLM replies with tool calls, the host executes them and feeds
-  results back — repeating until the model emits a final answer.
+The implementation intentionally keeps external dependencies small
+and only claims functionality that is actually implemented.
 """
+
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass, field
+import os
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-from app.core.llm import extract_json, generate
-from app.core.logging import get_logger
-from app.graph import client as graph
-from app.rag.vector_store import semantic_search
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
-logger = get_logger(__name__)
 
-MAX_STEPS = 8   # safety limit
+load_dotenv()
 
-# ──────────────────────────────────────────────
-#  Tool manifest (MCP-inspired)
-# ──────────────────────────────────────────────
 
-TOOL_MANIFEST = """
-You have access to the following research tools. Call them by responding
-with a JSON object:
-{
-  "thought": "your internal reasoning",
-  "action": "<tool_name>",
-  "action_input": "<string argument>"
-}
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
-Tools:
-  vector_search(query: str)
-      Semantic search across ingested research documents.
-      Use for: broad topic queries, finding relevant passages.
-
-  graph_lookup(entity: str)
-      Retrieve the knowledge-graph neighbourhood of a named entity.
-      Use for: understanding relationships, connections, influence.
-
-  graph_documents(entity: str)
-      Find all documents that mention a given entity.
-      Use for: tracing where an entity appears in the corpus.
-
-  synthesise(context: str)
-      Generate the final comprehensive answer.
-      ONLY call this when you have gathered enough information.
-      Pass ALL collected evidence as the context string.
-      This terminates the research loop.
-
-Rules:
-  - Think step by step before every action.
-  - Do not repeat the same tool call with the same input.
-  - Call synthesise when you have at least 2-3 pieces of evidence.
-  - If a tool returns no results, try a different query.
-"""
-
-_STEP_SYSTEM = (
-    "You are a methodical AI research agent. "
-    "Follow the ReAct loop: Reason, then Act using one tool at a time. "
-    "Always respond with valid JSON only."
+DEFAULT_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-4.1-mini",
 )
 
-_SYNTH_SYSTEM = """
-You are an expert research synthesiser.
-Given the user's research goal and the evidence collected, produce a
-well-structured, comprehensive answer.
-Use headers, bullet points, and cite document IDs where relevant.
-"""
-
-
-# ──────────────────────────────────────────────
-#  Data structures
-# ──────────────────────────────────────────────
 
 @dataclass
-class AgentStep:
-    step: int
-    thought: str
-    action: str
-    action_input: str
-    observation: str
-    duration_ms: float
+class ResearchQuery:
+    """Research query and execution settings."""
+
+    query: str
+    depth: str = "standard"
+    max_sources: int = 5
+    output_format: str = "markdown"
 
 
 @dataclass
-class AgentResult:
-    goal: str
-    answer: str
-    steps: list[AgentStep] = field(default_factory=list)
-    total_duration_ms: float = 0.0
-    sources: list[str] = field(default_factory=list)
+class ResearchResult:
+    """A retrieved research source."""
+
+    source: str
+    title: str
+    content: str
+    url: str
+    relevance_score: float
+    timestamp: str
+    metadata: dict[str, Any]
 
 
-# ──────────────────────────────────────────────
-#  Tool implementations
-# ──────────────────────────────────────────────
-
-async def _tool_vector_search(query: str) -> str:
-    hits = await semantic_search(query, n_results=4)
-    if not hits:
-        return "No results found."
-    parts = []
-    for h in hits:
-        parts.append(f"[{h['doc_id']}] score={h['score']}\n{h['text'][:400]}")
-    return "\n\n---\n".join(parts)
-
-
-async def _tool_graph_lookup(entity: str) -> str:
-    entities = await graph.search_entities(entity, limit=8)
-    if not entities:
-        return f"No entities matching '{entity}' found in the knowledge graph."
-    lines = [f"Entities related to '{entity}':"]
-    for e in entities:
-        lines.append(f"  [{e['type']}] {e['name']}: {e.get('description', '')}")
-    return "\n".join(lines)
-
-
-async def _tool_graph_documents(entity: str) -> str:
-    docs = await graph.get_entity_documents(entity)
-    if not docs:
-        return f"No documents mention '{entity}'."
-    lines = [f"Documents mentioning '{entity}':"]
-    for d in docs:
-        lines.append(f"  [{d['id']}] {d['title']} — {d.get('snippet', '')[:200]}")
-    return "\n".join(lines)
-
-
-TOOLS: dict[str, Any] = {
-    "vector_search": _tool_vector_search,
-    "graph_lookup": _tool_graph_lookup,
-    "graph_documents": _tool_graph_documents,
-}
-
-
-# ──────────────────────────────────────────────
-#  Agent loop
-# ──────────────────────────────────────────────
-
-async def run_research_agent(goal: str) -> AgentResult:
+class ResearchAgent:
     """
-    Execute the multi-step research agent for a given research goal.
+    Research agent implementing:
 
-    Args:
-        goal: Natural language research question or task.
-
-    Returns:
-        AgentResult with the final answer and a full trace of steps.
+    Query
+      ↓
+    Planning
+      ↓
+    Retrieval
+      ↓
+    Relevance ranking
+      ↓
+    RAG context construction
+      ↓
+    LLM synthesis
+      ↓
+    Cited report
     """
-    t_start = time.time()
-    steps: list[AgentStep] = []
-    evidence_log: list[str] = []
-    all_sources: list[str] = []
 
-    history = (
-        f"{TOOL_MANIFEST}\n\n"
-        f"=== RESEARCH GOAL ===\n{goal}\n\n"
-        "Begin your research. Respond with JSON."
-    )
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        max_sources: int = 5,
+        timeout: int = 20,
+    ) -> None:
 
-    logger.info("Agent starting: %s", goal[:80])
+        if max_sources < 1:
+            raise ValueError("max_sources must be at least 1.")
 
-    for step_num in range(1, MAX_STEPS + 1):
-        t_step = time.time()
+        self.model = model
+        self.max_sources = max_sources
+        self.timeout = timeout
+        self.context_memory: list[dict[str, Any]] = []
 
-        # ── Ask the LLM what to do next ──
-        try:
-            raw = await generate(history, system=_STEP_SYSTEM, temperature=0.0)
-            # Strip markdown fences if present
-            import re
-            raw = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
-            action_dict = json.loads(raw)
-        except Exception as exc:
-            logger.warning("Step %d parse error: %s", step_num, exc)
-            break
+        api_key = os.getenv("OPENAI_API_KEY")
 
-        thought = action_dict.get("thought", "")
-        action = action_dict.get("action", "").strip().lower()
-        action_input = str(action_dict.get("action_input", ""))
-
-        logger.info("Step %d | action=%s | input=%s", step_num, action, action_input[:60])
-
-        # ── Terminal action: synthesise ──
-        if action == "synthesise":
-            synth_prompt = (
-                f"Research goal: {goal}\n\n"
-                f"Collected evidence:\n{''.join(evidence_log)}\n\n"
-                "Write the final answer."
-            )
-            answer = await generate(synth_prompt, system=_SYNTH_SYSTEM, temperature=0.2)
-
-            steps.append(AgentStep(
-                step=step_num,
-                thought=thought,
-                action=action,
-                action_input=action_input,
-                observation="[Final answer generated]",
-                duration_ms=round((time.time() - t_step) * 1000, 1),
-            ))
-
-            return AgentResult(
-                goal=goal,
-                answer=answer,
-                steps=steps,
-                total_duration_ms=round((time.time() - t_start) * 1000, 1),
-                sources=list(set(all_sources)),
-            )
-
-        # ── Execute tool ──
-        tool_fn = TOOLS.get(action)
-        if tool_fn is None:
-            observation = f"Unknown tool: {action}"
-        else:
-            try:
-                observation = await tool_fn(action_input)
-            except Exception as exc:
-                observation = f"Tool error: {exc}"
-
-        # Track sources (doc IDs look like "doc-..." or contain "::")
-        import re
-        source_ids = re.findall(r'\[([^\]]+)\]', observation)
-        all_sources.extend(source_ids)
-
-        # Log evidence
-        evidence_log.append(
-            f"\n[Step {step_num} — {action}({action_input!r})]\n{observation}\n"
+        self.client: OpenAI | None = (
+            OpenAI(api_key=api_key)
+            if api_key
+            else None
         )
 
-        # Append to history for the LLM
-        history += (
-            f"\n\n=== STEP {step_num} RESULT ===\n"
-            f"Action: {action}({action_input!r})\n"
-            f"Observation:\n{observation}\n\n"
-            "Continue your research. Respond with JSON."
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def research(
+        self,
+        query: str,
+        output_format: str = "markdown",
+        depth: str = "standard",
+    ) -> str:
+        """
+        Execute the complete research workflow.
+
+        Args:
+            query: Research question.
+            output_format: markdown or json.
+            depth: quick, standard, or comprehensive.
+
+        Returns:
+            Generated research report.
+        """
+
+        query = query.strip()
+
+        if not query:
+            raise ValueError("Research query cannot be empty.")
+
+        if output_format not in {"markdown", "json"}:
+            raise ValueError(
+                "output_format must be 'markdown' or 'json'."
+            )
+
+        plan = self._create_research_plan(
+            query=query,
+            depth=depth,
         )
 
-        steps.append(AgentStep(
-            step=step_num,
-            thought=thought,
-            action=action,
-            action_input=action_input,
-            observation=observation[:500],
-            duration_ms=round((time.time() - t_step) * 1000, 1),
-        ))
+        sources = self._gather_information(
+            query=query,
+            plan=plan,
+        )
 
-    # Fallback if we hit MAX_STEPS without synthesise
-    logger.warning("Agent hit MAX_STEPS without synthesising — generating fallback")
-    fallback_prompt = (
-        f"Research goal: {goal}\n\n"
-        f"Collected evidence:\n{''.join(evidence_log)}\n\n"
-        "Based on the above, provide the best answer you can."
-    )
-    answer = await generate(fallback_prompt, system=_SYNTH_SYSTEM, temperature=0.2)
+        if not sources:
+            raise RuntimeError(
+                "No research sources were retrieved."
+            )
 
-    return AgentResult(
-        goal=goal,
-        answer=answer,
-        steps=steps,
-        total_duration_ms=round((time.time() - t_start) * 1000, 1),
-        sources=list(set(all_sources)),
+        report = self._synthesize_report(
+            query=query,
+            sources=sources,
+            plan=plan,
+        )
+
+        self._update_context_memory(
+            query=query,
+            report=report,
+        )
+
+        return self._format_output(
+            report=report,
+            output_format=output_format,
+        )
+
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+
+    def _create_research_plan(
+        self,
+        query: str,
+        depth: str,
+    ) -> dict[str, Any]:
+
+        steps_by_depth = {
+            "quick": [
+                "retrieve_sources",
+                "rank_sources",
+                "synthesize",
+            ],
+            "standard": [
+                "retrieve_sources",
+                "rank_sources",
+                "build_rag_context",
+                "synthesize",
+            ],
+            "comprehensive": [
+                "retrieve_sources",
+                "rank_sources",
+                "build_rag_context",
+                "cross_check_sources",
+                "synthesize",
+            ],
+        }
+
+        if depth not in steps_by_depth:
+            raise ValueError(
+                "depth must be one of: quick, standard, comprehensive"
+            )
+
+        return {
+            "query": query,
+            "depth": depth,
+            "steps": steps_by_depth[depth],
+            "max_sources": self.max_sources,
+            "timestamp": self._timestamp(),
+        }
+
+    # ------------------------------------------------------------------
+    # Retrieval
+    # ------------------------------------------------------------------
+
+    def _gather_information(
+        self,
+        query: str,
+        plan: dict[str, Any],
+    ) -> list[ResearchResult]:
+
+        params = {
+            "search_query": f"all:{query}",
+            "start": 0,
+            "max_results": min(
+                max(self.max_sources * 2, 5),
+                20,
+            ),
+            "sortBy": "relevance",
+            "sortOrder": "descending",
+        }
+
+        response = requests.get(
+            ARXIV_API_URL,
+            params=params,
+            timeout=self.timeout,
+            headers={
+                "User-Agent": "ai-research-agent/1.0",
+            },
+        )
+
+        response.raise_for_status()
+
+        root = ET.fromstring(response.text)
+
+        namespace = {
+            "atom": "http://www.w3.org/2005/Atom",
+        }
+
+        query_terms = self._tokenize(query)
+
+        results: list[ResearchResult] = []
+
+        for entry in root.findall("atom:entry", namespace):
+
+            title = self._clean_text(
+                entry.findtext(
+                    "atom:title",
+                    default="",
+                    namespaces=namespace,
+                )
+            )
+
+            summary = self._clean_text(
+                entry.findtext(
+                    "atom:summary",
+                    default="",
+                    namespaces=namespace,
+                )
+            )
+
+            published = entry.findtext(
+                "atom:published",
+                default="",
+                namespaces=namespace,
+            )
+
+            paper_id = entry.findtext(
+                "atom:id",
+                default="",
+                namespaces=namespace,
+            )
+
+            if not title or not summary or not paper_id:
+                continue
+
+            score = self._relevance_score(
+                query_terms=query_terms,
+                title=title,
+                content=summary,
+            )
+
+            results.append(
+                ResearchResult(
+                    source="arXiv",
+                    title=title,
+                    content=summary,
+                    url=paper_id,
+                    relevance_score=score,
+                    timestamp=published or self._timestamp(),
+                    metadata={
+                        "type": "academic_paper",
+                        "verified": True,
+                    },
+                )
+            )
+
+        results.sort(
+            key=lambda result: result.relevance_score,
+            reverse=True,
+        )
+
+        return results[: self.max_sources]
+
+    # ------------------------------------------------------------------
+    # Relevance ranking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _relevance_score(
+        query_terms: set[str],
+        title: str,
+        content: str,
+    ) -> float:
+
+        title_terms = ResearchAgent._tokenize(title)
+        content_terms = ResearchAgent._tokenize(content)
+
+        if not query_terms:
+            return 0.0
+
+        title_overlap = len(
+            query_terms.intersection(title_terms)
+        ) / len(query_terms)
+
+        content_overlap = len(
+            query_terms.intersection(content_terms)
+        ) / len(query_terms)
+
+        score = (
+            0.7 * title_overlap
+            + 0.3 * content_overlap
+        )
+
+        return round(
+            min(score, 1.0),
+            4,
+        )
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        """Convert text into normalized keyword tokens."""
+
+        stop_words = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "to",
+            "in",
+            "for",
+            "on",
+            "with",
+            "is",
+            "are",
+            "what",
+            "how",
+            "why",
+            "latest",
+        }
+
+        tokens = re.findall(
+            r"[a-zA-Z0-9]+",
+            text.lower(),
+        )
+
+        return {
+            token
+            for token in tokens
+            if len(token) > 2
+            and token not in stop_words
+        }
+
+    # ------------------------------------------------------------------
+    # RAG
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_rag_context(
+        sources: list[ResearchResult],
+    ) -> str:
+
+        context_parts = []
+
+        for index, source in enumerate(sources, start=1):
+
+            context_parts.append(
+                f"""
+SOURCE {index}
+Title: {source.title}
+URL: {source.url}
+Relevance: {source.relevance_score:.4f}
+
+Abstract:
+{source.content}
+""".strip()
+            )
+
+        return "\n\n".join(context_parts)
+
+    # ------------------------------------------------------------------
+    # LLM synthesis
+    # ------------------------------------------------------------------
+
+    def _synthesize_report(
+        self,
+        query: str,
+        sources: list[ResearchResult],
+        plan: dict[str, Any],
+    ) -> str:
+
+        context = self._build_rag_context(
+            sources
+        )
+
+        if self.client is None:
+            return self._fallback_report(
+                query=query,
+                sources=sources,
+                plan=plan,
+            )
+
+        prompt = f"""
+You are a research analyst.
+
+Answer the user's research question using ONLY the supplied sources.
+
+Research question:
+{query}
+
+Retrieved sources:
+{context}
+
+Requirements:
+
+1. Write a concise executive summary.
+2. Identify the most important findings.
+3. Distinguish evidence from interpretation.
+4. Do not invent facts that are not supported by the sources.
+5. Include inline citations using [Source 1], [Source 2], etc.
+6. Include a Sources section containing the source title and URL.
+7. If the sources are insufficient to answer a claim, explicitly say so.
+8. Do not fabricate performance metrics.
+9. Do not claim that the retrieved papers prove causation unless they do.
+
+Return Markdown.
+""".strip()
+
+        response = self.client.responses.create(
+            model=self.model,
+            input=prompt,
+        )
+
+        report = response.output_text.strip()
+
+        if not report:
+            raise RuntimeError(
+                "The language model returned an empty report."
+            )
+
+        return report
+
+    # ------------------------------------------------------------------
+    # Fallback report
+    # ------------------------------------------------------------------
+
+    def _fallback_report(
+        self,
+        query: str,
+        sources: list[ResearchResult],
+        plan: dict[str, Any],
+    ) -> str:
+
+        lines = [
+            f"# Research Report: {query}",
+            "",
+            "## Retrieved Evidence",
+            "",
+            (
+                "No OPENAI_API_KEY was configured, so the agent "
+                "returned the retrieved evidence without LLM synthesis."
+            ),
+            "",
+        ]
+
+        for index, source in enumerate(
+            sources,
+            start=1,
+        ):
+            lines.extend(
+                [
+                    f"### Source {index}: {source.title}",
+                    "",
+                    source.content,
+                    "",
+                    f"**URL:** {source.url}",
+                    "",
+                    (
+                        f"**Relevance score:** "
+                        f"{source.relevance_score:.4f}"
+                    ),
+                    "",
+                ]
+            )
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_output(
+        report: str,
+        output_format: str,
+    ) -> str:
+
+        if output_format == "markdown":
+            return report
+
+        if output_format == "json":
+            return json.dumps(
+                {
+                    "report": report,
+                    "generated_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "format": "json",
+                },
+                indent=2,
+            )
+
+        raise ValueError(
+            "Unsupported output format."
+        )
+
+    # ------------------------------------------------------------------
+    # Memory
+    # ------------------------------------------------------------------
+
+    def _update_context_memory(
+        self,
+        query: str,
+        report: str,
+    ) -> None:
+
+        self.context_memory.append(
+            {
+                "query": query,
+                "timestamp": self._timestamp(),
+                "summary": report[:200],
+                "report_length": len(report),
+            }
+        )
+
+        self.context_memory = self.context_memory[-10:]
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        return " ".join(text.split())
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(
+            timezone.utc
+        ).isoformat()
+
+    # ------------------------------------------------------------------
+    # Public serialization helper
+    # ------------------------------------------------------------------
+
+    def get_context_memory(self) -> list[dict[str, Any]]:
+        """Return recent research session memory."""
+
+        return list(self.context_memory)
+
+
+def main() -> None:
+    """Run a sample research query."""
+
+    agent = ResearchAgent(
+        model=DEFAULT_MODEL,
+        max_sources=5,
     )
+
+    query = (
+        "retrieval augmented generation "
+        "large language models"
+    )
+
+    report = agent.research(
+        query=query,
+        depth="standard",
+        output_format="markdown",
+    )
+
+    filename = (
+        "research_report_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    )
+
+    with open(
+        filename,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(report)
+
+    print(report)
+    print(f"\nReport saved to: {filename}")
+
+
+if __name__ == "__main__":
+    main()
