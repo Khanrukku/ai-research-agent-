@@ -13,6 +13,7 @@ def test_chunk_text_long_has_overlap():
     from app.rag.vector_store import chunk_text
 
     text = "A " * 500
+
     chunks = chunk_text(
         text,
         chunk_size=200,
@@ -75,33 +76,11 @@ def test_app_creates():
     assert app.version == "2.0.0"
 
 
-def _collect_route_paths(routes):
-    """
-    Safely collect paths from FastAPI/Starlette routes.
-
-    Some route objects may represent included routers and
-    therefore may not expose a direct `.path` attribute.
-    """
-    paths = set()
-
-    for route in routes:
-        path = getattr(route, "path", None)
-
-        if path:
-            paths.add(path)
-
-        nested_routes = getattr(route, "routes", None)
-
-        if nested_routes:
-            paths.update(_collect_route_paths(nested_routes))
-
-    return paths
-
-
 def test_routes_registered():
     from app.main import app
 
-    paths = _collect_route_paths(app.routes)
+    schema = app.openapi()
+    paths = set(schema["paths"].keys())
 
     assert "/api/v1/health" in paths
     assert "/api/v1/ingest" in paths
